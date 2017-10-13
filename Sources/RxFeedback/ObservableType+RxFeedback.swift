@@ -64,6 +64,31 @@ extension ObservableType where E == Any {
         ) -> Observable<State> {
         return system(initialState: initialState, reduce: reduce, scheduler: scheduler, scheduledFeedback: scheduledFeedback)
     }
+    
+    public static func sustemV2<State, Event>(
+        initialState: State,
+        reduce: @escaping (State, Event) -> State,
+        scheduler: ImmediateSchedulerType,
+        scheduledFeedback: [FeedbackLoopV2<State, Event>]
+        ) -> Observable<State> {
+        let replaySubject = ReplaySubject<State>.create(bufferSize: 1)
+        
+        let asyncScheduler = scheduler.async
+        
+        let events: Observable<Event> = Observable.merge(scheduledFeedback.map { feedback in
+            return feedback.loop(asyncScheduler, replaySubject.asObservable())
+        })
+        
+        return events.scan(initialState, accumulator: reduce)
+            .do(onNext: { output in
+                replaySubject.onNext(output)
+            }, onSubscribed: {
+                replaySubject.onNext(initialState)
+            })
+            .subscribeOn(scheduler)
+            .startWith(initialState)
+            .observeOn(scheduler)
+    }
 }
 
 extension SharedSequenceConvertibleType where E == Any {
@@ -144,5 +169,39 @@ public struct ObservableSchedulerContext<Element>: ObservableType {
 
     public func subscribe<O: ObserverType>(_ observer: O) -> Disposable where O.E == E {
         return self.source.subscribe(observer)
+    }
+}
+
+public struct FeedbackLoopV2<State, Event> {
+    let loop: (ImmediateSchedulerType, Observable<State>) -> Observable<Event>
+    
+    public init<Control: Equatable>(query: @escaping (State) -> Control?, effects: @escaping (Control) -> Observable<Event>) {
+        self.loop = { scheduler, state -> Observable<Event> in
+            return state.map(query)
+                .distinctUntilChanged { $0 == $1 }
+                .flatMapLatest { control -> Observable<Event> in
+                    guard let control = control else { return Observable.empty() }
+                    
+                    return effects(control).enqueue(scheduler)
+                }
+        }
+    }
+    
+    public init(predicate: @escaping (State) -> Bool, effects: @escaping (State) -> Observable<Event>) {
+        self.loop = { scheduler, state -> Observable<Event> in
+            return state.flatMapLatest { state -> Observable<Event> in
+                guard predicate(state) else { return Observable.empty() }
+                
+                return effects(state).enqueue(scheduler)
+            }
+        }
+    }
+    
+    public init(effects: @escaping (State) -> Observable<Event>) {
+        self.loop = { scheduler, state in
+            return state.flatMapLatest { state in
+                return effects(state).enqueue(scheduler)
+            }
+        }
     }
 }
